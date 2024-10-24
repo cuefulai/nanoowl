@@ -499,7 +499,7 @@ class NanoOwl:
                 print("Failed to decode image")
                 return None
                 
-            # Convert BGR to RGB
+            img = cv2.flip(img, 1)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             # Convert to PIL Image for processing
