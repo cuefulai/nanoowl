@@ -1,7 +1,7 @@
 import modal
 import os
 
-stub = modal.Stub("nanoowl-app")
+app = modal.App("nanoowl-app")
 volume = modal.Volume.from_name("nanoowl-engines", create_if_missing=True)
 
 ENGINE_DIR = "/root/data"
@@ -383,7 +383,7 @@ image = (modal.Image.from_dockerfile("docker/23-01/Dockerfile")
              f"mkdir -p {ENGINE_DIR}"
          ))
 
-@stub.cls(
+@app.cls(
     image=image,
     gpu="t4",
     volumes={ENGINE_DIR: volume},
