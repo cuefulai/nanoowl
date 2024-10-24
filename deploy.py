@@ -160,12 +160,21 @@ class NanoOwl:
     def app(self):
         from fastapi import FastAPI, WebSocket
         from fastapi.responses import HTMLResponse, FileResponse
+        from fastapi.middleware.cors import CORSMiddleware
         import logging
         import weakref
         from nanoowl.tree import Tree
         
         app = FastAPI()
-        app.state.websockets = weakref.WeakSet()
+        
+        # Add CORS middleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
         
         @app.get("/")
         async def root():
