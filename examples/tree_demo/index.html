@@ -53,52 +53,77 @@
     </style>
 
     <script type="text/javascript">
-
-        function jpeg_binary_to_base64(buffer){
-            var base64 = btoa(new Uint8Array(buffer).reduce(function (data, byte) {
-                return data + String.fromCharCode(byte);
-            }, ''));
-            return "data:image/jpeg;base64," + base64;
-        }
-
-        var ws = undefined
+        let ws;
+        let videoStream;
+        let videoElement;
+        let canvasElement;
+        let canvasContext;
         
-        console.log(location.host);
-
-        ws = new WebSocket("ws://" + location.host + "/ws");
-
-        ws.onopen = function () {
-
-            console.log("Connected.");
-
-            var prompt_input = document.getElementById("prompt_input")
-
-            function handle_prompt_change(event) {
-
-                console.log("Sending prompt: " + event.target.value);
-
-                if (typeof ws !== 'undefined') {
-                    ws.send("prompt:" + event.target.value);
-                }
-            }
-
-            prompt_input.oninput = handle_prompt_change;
-        };
-
-        ws.onclose = function () {
-            console.log("Disconnected.");
-        };
-
-        ws.onmessage = function (event) {
-            var camera_image = document.getElementById("camera_image");
-            var reader = new FileReader();
-            reader.readAsDataURL(event.data);
-            reader.onloadend = function () {
-                console.log("Received message.");
-                camera_image.src = reader.result;
+        async function setupWebcam() {
+            try {
+                videoStream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: 640,
+                        height: 480
+                    } 
+                });
+                
+                videoElement = document.createElement('video');
+                videoElement.srcObject = videoStream;
+                videoElement.play();
+                
+                canvasElement = document.createElement('canvas');
+                canvasElement.width = 640;
+                canvasElement.height = 480;
+                canvasContext = canvasElement.getContext('2d');
+                
+                // Start sending frames once video is playing
+                videoElement.onplaying = () => {
+                    sendFrame();
+                };
+            } catch (error) {
+                console.error('Error accessing webcam:', error);
             }
         }
 
+        function sendFrame() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                canvasContext.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+                const frame = canvasElement.toDataURL('image/jpeg', 0.5);
+                ws.send('frame:' + frame);
+            }
+            // Schedule next frame
+            requestAnimationFrame(sendFrame);
+        }
+
+        window.onload = function() {
+            ws = new WebSocket("ws://" + location.host + "/ws");
+
+            ws.onopen = function () {
+                console.log("Connected.");
+                setupWebcam();
+
+                var prompt_input = document.getElementById("prompt_input");
+                prompt_input.oninput = function(event) {
+                    console.log("Sending prompt: " + event.target.value);
+                    ws.send("prompt:" + event.target.value);
+                };
+            };
+
+            ws.onclose = function () {
+                console.log("Disconnected.");
+                if (videoStream) {
+                    videoStream.getTracks().forEach(track => track.stop());
+                }
+            };
+
+            ws.onmessage = function (event) {
+                if (typeof event.data === 'string' && event.data.startsWith('processed_frame:')) {
+                    const base64Image = event.data.split('processed_frame:')[1];
+                    document.getElementById("camera_image").src = 'data:image/jpeg;base64,' + base64Image;
+                }
+            };
+        };
     </script>
 </head>
 <body>
