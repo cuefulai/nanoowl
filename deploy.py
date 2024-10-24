@@ -1,7 +1,7 @@
 import modal
 import os
 
-app = modal.App("nanoowl-deployment")
+stub = modal.Stub("nanoowl-app")
 volume = modal.Volume.from_name("nanoowl-engines", create_if_missing=True)
 
 ENGINE_DIR = "/root/data"
@@ -25,7 +25,7 @@ image = (modal.Image.from_dockerfile("docker/23-01/Dockerfile")
              f"mkdir -p {ENGINE_DIR}"
          ))
 
-@app.cls(
+@stub.cls(
     image=image,
     gpu="t4",
     volumes={ENGINE_DIR: volume},
@@ -35,8 +35,13 @@ image = (modal.Image.from_dockerfile("docker/23-01/Dockerfile")
     container_idle_timeout=300
 )
 class NanoOwl:
+    def __init__(self):
+        self.is_initialized = False
+        self.prompt_data = None
+
     @modal.enter()
-    def setup(self):
+    def initialize(self):
+        """Initialize the model and infrastructure"""
         import os
         import subprocess
         from nanoowl.owl_predictor import OwlPredictor
@@ -45,10 +50,9 @@ class NanoOwl:
         print("Starting initialization...")
         
         self.engine_path = f"{ENGINE_DIR}/owl_image_encoder_patch32.engine"
-        self.is_ready = False
         
         if not os.path.exists(self.engine_path):
-            print("Building TensorRT engine (this may take a few minutes)...")
+            print("Building TensorRT engine...")
             subprocess.run([
                 "python3", 
                 "-m",
@@ -64,7 +68,7 @@ class NanoOwl:
                 image_encoder_engine=self.engine_path
             )
         )
-        self.is_ready = True
+        self.is_initialized = True
         print("Initialization complete!")
 
     def get_loading_html(self):
@@ -72,8 +76,9 @@ class NanoOwl:
         <!DOCTYPE html>
         <html>
         <head>
+            <meta http-equiv="refresh" content="5">
             <style>
-                body {
+                body { 
                     font-family: Arial, sans-serif;
                     display: flex;
                     justify-content: center;
@@ -103,9 +108,6 @@ class NanoOwl:
                     100% { transform: rotate(360deg); }
                 }
             </style>
-            <script>
-                setTimeout(() => location.reload(), 5000);
-            </script>
         </head>
         <body>
             <div class="loading-container">
@@ -117,8 +119,7 @@ class NanoOwl:
         </html>
         """
 
-    @modal.method()
-    def process_frame(self, frame_data: str, prompt: str = None):
+    def process_frame(self, frame_data: str):
         import base64
         import cv2
         import numpy as np
@@ -128,6 +129,8 @@ class NanoOwl:
         
         try:
             # Decode base64 image
+            if 'base64,' in frame_data:
+                frame_data = frame_data.split('base64,')[1]
             img_data = base64.b64decode(frame_data)
             nparr = np.frombuffer(img_data, np.uint8)
             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -135,22 +138,14 @@ class NanoOwl:
             # Convert to PIL Image
             image_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             
-            if prompt:
-                # Process image with NanoOWL
-                tree = Tree.from_prompt(prompt)
-                clip_encodings = self.predictor.encode_clip_text(tree)
-                owl_encodings = self.predictor.encode_owl_text(tree)
-                
+            if self.prompt_data is not None:
                 detections = self.predictor.predict(
                     image_pil,
-                    tree=tree,
-                    clip_text_encodings=clip_encodings,
-                    owl_text_encodings=owl_encodings
+                    tree=self.prompt_data['tree'],
+                    clip_text_encodings=self.prompt_data['clip_encodings'],
+                    owl_text_encodings=self.prompt_data['owl_encodings']
                 )
-                
-                # Draw detections
-                image = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-                image = draw_tree_output(image, detections, tree)
+                image = draw_tree_output(image, detections, self.prompt_data['tree'])
             
             # Encode processed image
             _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 50])
@@ -161,67 +156,65 @@ class NanoOwl:
             print(f"Error processing frame: {e}")
             return None
 
-    @modal.web_endpoint()
-    async def serve(self):
-        import aiohttp
-        from aiohttp import web
-        import asyncio
+    @modal.asgi_app()
+    def app(self):
+        from fastapi import FastAPI, WebSocket
+        from fastapi.responses import HTMLResponse, FileResponse
         import logging
         import weakref
+        from nanoowl.tree import Tree
         
-        async def handle_index(request):
-            if not hasattr(self, 'is_ready') or not self.is_ready:
-                return web.Response(
-                    text=self.get_loading_html(),
-                    content_type='text/html'
-                )
-            return web.FileResponse("/root/nanoowl/examples/tree_demo/index.html")
+        app = FastAPI()
+        app.state.websockets = weakref.WeakSet()
         
-        async def websocket_handler(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            request.app['websockets'].add(ws)
-            
-            prompt_data = None
+        @app.get("/")
+        async def root():
+            if not self.is_initialized:
+                return HTMLResponse(self.get_loading_html())
+            return FileResponse("/root/nanoowl/examples/tree_demo/index.html")
+        
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            app.state.websockets.add(websocket)
             
             try:
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        if "prompt:" in msg.data:
-                            prompt = msg.data.split("prompt:")[1]
-                            prompt_data = prompt
-                            await ws.send_str("status:Prompt updated")
-                        elif "frame:" in msg.data:
-                            frame_data = msg.data.split("frame:")[1]
-                            # Process frame and send back result
-                            processed_frame = await asyncio.get_event_loop().run_in_executor(
-                                None, self.process_frame, frame_data, prompt_data
-                            )
-                            if processed_frame:
-                                await ws.send_str(f"processed_frame:{processed_frame}")
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        print(f"WebSocket error: {ws.exception()}")
+                async for message in websocket.iter_text():
+                    if "prompt:" in message:
+                        try:
+                            prompt = message.split("prompt:")[1]
+                            tree = Tree.from_prompt(prompt)
+                            clip_encodings = self.predictor.encode_clip_text(tree)
+                            owl_encodings = self.predictor.encode_owl_text(tree)
+                            self.prompt_data = {
+                                "tree": tree,
+                                "clip_encodings": clip_encodings,
+                                "owl_encodings": owl_encodings
+                            }
+                            await websocket.send_text("status:Prompt updated")
+                        except Exception as e:
+                            print(f"Error processing prompt: {e}")
+                            await websocket.send_text(f"error:Failed to process prompt: {str(e)}")
+                    
+                    elif "frame:" in message:
+                        frame_data = message.split("frame:")[1]
+                        processed_frame = self.process_frame(frame_data)
+                        if processed_frame:
+                            await websocket.send_text(f"processed_frame:{processed_frame}")
+            
+            except Exception as e:
+                print(f"WebSocket error: {e}")
             finally:
-                request.app['websockets'].discard(ws)
-            return ws
+                app.state.websockets.remove(websocket)
+                await websocket.close()
 
-        async def on_shutdown(app):
-            for ws in set(app['websockets']):
-                await ws.close(code=aiohttp.WSCloseCode.GOING_AWAY, 
-                             message='Server shutdown')
+        @app.on_event("shutdown")
+        async def shutdown():
+            for ws in app.state.websockets:
+                await ws.close()
 
-        app = web.Application()
-        app['websockets'] = weakref.WeakSet()
-        
-        app.router.add_get("/", handle_index)
-        app.router.add_get("/ws", websocket_handler)
-        app.on_shutdown.append(on_shutdown)
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', 7860)
-        await site.start()
-        
-        # Keep the server running
-        while True:
-            await asyncio.sleep(3600)
+        return app
+
+# For development
+if __name__ == "__main__":
+    stub.serve()
