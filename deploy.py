@@ -20,7 +20,7 @@ image = (modal.Image.from_dockerfile("docker/23-01/Dockerfile")
              "numpy"
          ])
          .run_commands(
-             "cd /root && git clone https://github.com/NVIDIA-AI-IOT/nanoowl",
+             "cd /root && git clone https://github.com/cuefulai/nanoowl",
              "cd /root/nanoowl && python3 setup.py develop",
              f"mkdir -p {ENGINE_DIR}"
          ))
