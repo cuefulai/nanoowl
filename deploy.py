@@ -151,6 +151,9 @@ HTML_CONTENT = """
         let canvasContext;
         let reconnectAttempts = 0;
         const MAX_RECONNECT_ATTEMPTS = 5;
+        let lastProcessingTime = Date.now();
+        const MINIMUM_PROCESSING_INTERVAL = 100; // Minimum 100ms between frames (max 10 fps)
+        let processingFrame = false;
         
         function showLoading(message = "Initializing...") {
             const loadingContainer = document.getElementById('loading-container');
@@ -186,8 +189,9 @@ HTML_CONTENT = """
                 showLoading("Requesting camera access...");
                 videoStream = await navigator.mediaDevices.getUserMedia({ 
                     video: { 
-                        width: 640,
-                        height: 480
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        frameRate: { ideal: 10, max: 15 }
                     } 
                 });
                 
@@ -198,7 +202,9 @@ HTML_CONTENT = """
                 canvasElement = document.createElement('canvas');
                 canvasElement.width = 640;
                 canvasElement.height = 480;
-                canvasContext = canvasElement.getContext('2d');
+                canvasContext = canvasElement.getContext('2d', {
+                    willReadFrequently: true
+                });
                 
                 videoElement.onplaying = () => {
                     hideLoading();
@@ -210,11 +216,23 @@ HTML_CONTENT = """
             }
         }
 
-        function sendFrame() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                canvasContext.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
-                const frame = canvasElement.toDataURL('image/jpeg', 0.5);
-                ws.send('frame:' + frame);
+        async function sendFrame() {
+            if (ws && ws.readyState === WebSocket.OPEN && !processingFrame) {
+                const currentTime = Date.now();
+                if (currentTime - lastProcessingTime >= MINIMUM_PROCESSING_INTERVAL) {
+                    processingFrame = true;
+                    
+                    try {
+                        canvasContext.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+                        const frame = canvasElement.toDataURL('image/jpeg', 0.5);
+                        ws.send('frame:' + frame);
+                        lastProcessingTime = currentTime;
+                    } catch (error) {
+                        console.error('Error processing frame:', error);
+                    } finally {
+                        processingFrame = false;
+                    }
+                }
             }
             requestAnimationFrame(sendFrame);
         }
@@ -473,8 +491,8 @@ class NanoOwl:
                 frame_data = frame_data.split('base64,')[1]
             img_data = base64.b64decode(frame_data)
             
-            # Convert to numpy array
-            nparr = np.frombuffer(img_data, np.uint8)
+            # Convert to numpy array and make it writable
+            nparr = np.frombuffer(img_data, np.uint8).copy()  # Add .copy() to make writable
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if img is None:
@@ -485,12 +503,12 @@ class NanoOwl:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             # Convert to PIL Image for processing
-            pil_img = Image.fromarray(img)
+            pil_img = Image.fromarray(img.copy())  # Add .copy() to make writable
             
             # Process image if prompt data exists
             if self.prompt_data:
                 try:
-                    tree_output = self.predictor.predict(  # Changed from predict_tree to predict
+                    tree_output = self.predictor.predict(
                         image=pil_img,
                         tree=self.prompt_data["tree"],
                         clip_text_encodings=self.prompt_data["clip_encodings"],
